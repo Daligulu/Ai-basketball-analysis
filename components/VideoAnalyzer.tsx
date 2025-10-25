@@ -1,7 +1,7 @@
 'use client'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import * as poseDetection from '@tensorflow-models/pose-detection'
-import '@tensorflow/tfjs-core'
+import * as tf from '@tensorflow/tfjs-core'
 import '@tensorflow/tfjs-converter'
 import '@tensorflow/tfjs-backend-webgl'
 import { angleDeg } from '@/lib/angles'
@@ -33,12 +33,12 @@ export default function VideoAnalyzer() {
   const raf = useRef<number | null>(null)
   const [msg, setMsg] = useState('')
 
-  // Init model
+  // Init model (register webgl backend and ready TF)
   useEffect(() => {
     (async () => {
       try {
-        await (await import('@tensorflow/tfjs-backend-webgl')).setWebGLBackend && (await import('@tensorflow/tfjs-backend-webgl'))
-        await (await import('@tensorflow/tfjs-core')).ready()
+        await tf.setBackend('webgl')
+        await tf.ready()
         const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
           modelType: 'lightning',
         } as any)
@@ -141,7 +141,6 @@ export default function VideoAnalyzer() {
   const currentShot = useRef<Shot | null>(null)
 
   const logic = (kps: KP[]|null, ball: Ball|null, t: number) => {
-    const lw = 0.3
     const leftElbow = kps?.[KP_NAMES.leftElbow]; const leftShoulder = kps?.[KP_NAMES.leftShoulder]; const leftWrist = kps?.[KP_NAMES.leftWrist]
     const rightElbow = kps?.[KP_NAMES.rightElbow]; const rightShoulder = kps?.[KP_NAMES.rightShoulder]; const rightWrist = kps?.[KP_NAMES.rightWrist]
     const leftKnee = kps?.[KP_NAMES.leftKnee]; const leftHip = kps?.[KP_NAMES.leftHip]; const rightKnee = kps?.[KP_NAMES.rightKnee]; const rightHip = kps?.[KP_NAMES.rightHip]
@@ -168,23 +167,7 @@ export default function VideoAnalyzer() {
       setState('released')
     }
 
-    // apex: ball vertical velocity crosses zero (from up to down)
-    if (ball?.ok) {
-      const lastY = latest.current.lastBallY
-      if (lastY !== null) {
-        const vy = ball.y - lastY
-        const vyPrev = lastY - (latest.current.lastBallY ?? lastY)
-        // Crossover detection (simplified): vy changes sign from <0 to >0
-        if (currentShot.current && currentShot.current.tRelease && currentShot.current.tApex == null) {
-          if (vy > 0 && (latest.current.lastBallY! - ball.y) < 1e-3) {
-            currentShot.current.tApex = t
-          }
-        }
-      }
-      latest.current.lastBallY = ball.y
-    }
-
-    // made/miss by hoop ROI crossing after release
+    // made/miss by hoop ROI crossing after release (simple heuristic)
     if (currentShot.current && currentShot.current.tRelease && hoop && ball?.ok) {
       const fromAbove = ball.y < hoop.y + 0.3 * hoop.h
       const inside = ball.x > hoop.x && ball.x < hoop.x + hoop.w && ball.y > hoop.y && ball.y < hoop.y + hoop.h
@@ -224,6 +207,7 @@ export default function VideoAnalyzer() {
 
       // ball
       const ball = detectBall(ctx)
+      if (ball.ok) setBallTrace(prev => (prev.concat([{x: ball.x, y: ball.y}]).slice(-60)))
 
       // logic
       const t = (performance.now() - t0) / 1000
@@ -235,6 +219,13 @@ export default function VideoAnalyzer() {
       if (ball?.ok) {
         hctx.strokeStyle = 'rgba(34,211,238,0.9)'; hctx.fillStyle = 'rgba(34,211,238,0.9)'
         hctx.beginPath(); hctx.arc(ball.x, ball.y, 8, 0, Math.PI*2); hctx.stroke()
+        // trace
+        hctx.beginPath()
+        for (let i=0;i<ballTrace.length;i++) {
+          const p = ballTrace[i]
+          if (i===0) hctx.moveTo(p.x, p.y); else hctx.lineTo(p.x, p.y)
+        }
+        hctx.stroke()
       }
       if (hoop) {
         hctx.strokeStyle = 'rgba(255,255,255,0.9)'
@@ -247,7 +238,7 @@ export default function VideoAnalyzer() {
       raf.current = requestAnimationFrame(tick as any)
     }
     raf.current = requestAnimationFrame(tick as any)
-  }, [detector, running, hoop])
+  }, [detector, running, hoop, ballTrace])
 
   // hoop ROI draw / drag
   const dragging = useRef<{x:number,y:number}|null>(null)
