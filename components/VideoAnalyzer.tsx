@@ -20,47 +20,22 @@ type Ball = { x: number, y: number, r: number, ok: boolean }
 type State = 'idle' | 'tracking' | 'released'
 
 async function createDetectorWithFallback() {
-  // 1) webgl backend
+  try { await tf.setBackend('webgl'); await tf.ready() } catch (_) {}
   try {
-    await tf.setBackend('webgl')
-    await tf.ready()
-  } catch (_) {
-    // ignore, we'll try wasm below
-  }
-  // 2) Try MoveNet first (may fail in部分地区因 tfhub 访问)
-  try {
-    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
-      modelType: 'lightning',
-    } as any)
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, { modelType: 'lightning' } as any)
     return { det, note: 'MoveNet ✔︎' }
-  } catch (e) {
-    console.warn('MoveNet load failed, fallback to BlazePose', e)
-  }
-  // 3) Fallback: BlazePose via Mediapipe CDN (一般在国内也可访问 jsDelivr)
+  } catch (e) { console.warn('MoveNet load failed, fallback to BlazePose', e) }
   try {
-    const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
-      runtime: 'mediapipe',
-      modelType: 'lite',
-      solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose'
-    } as any)
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, { runtime: 'mediapipe', modelType: 'lite', solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose' } as any)
     return { det, note: '已切换为 BlazePose ✔︎' }
-  } catch (e) {
-    console.warn('BlazePose load failed, fallback to WASM MoveNet', e)
-  }
-  // 4) Last resort: WASM backend + MoveNet (指定 wasm CDN 路径)
+  } catch (e) { console.warn('BlazePose load failed, fallback to WASM MoveNet', e) }
   try {
     const wasm = await import('@tensorflow/tfjs-backend-wasm')
     ;(wasm as any).setWasmPaths?.('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.19.0/dist/')
-    await tf.setBackend('wasm')
-    await tf.ready()
-    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
-      modelType: 'lightning',
-    } as any)
+    await tf.setBackend('wasm'); await tf.ready()
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, { modelType: 'lightning' } as any)
     return { det, note: '使用 WASM 后端 ✔︎' }
-  } catch (e) {
-    console.error('All detectors failed', e)
-    throw e
-  }
+  } catch (e) { console.error('All detectors failed', e); throw e }
 }
 
 export default function VideoAnalyzer() {
@@ -77,153 +52,77 @@ export default function VideoAnalyzer() {
   const raf = useRef<number | null>(null)
   const [msg, setMsg] = useState('')
 
-  // Init detector with fallbacks
   useEffect(() => {
     (async () => {
-      try {
-        const { det, note } = await createDetectorWithFallback()
-        setDetector(det)
-        setMsg(note)
-      } catch (e) {
-        setMsg('模型加载失败：网络或 CDN 访问受限。可尝试切换网络后刷新。')
-      }
+      try { const { det, note } = await createDetectorWithFallback(); setDetector(det); setMsg(note) }
+      catch { setMsg('模型加载失败：网络或 CDN 受限。请更换网络或刷新。') }
     })()
   }, [])
 
   const onFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+    const file = e.target.files?.[0]; if (!file) return
     const url = URL.createObjectURL(file)
     const v = videoRef.current!
     v.src = url
     v.onloadedmetadata = () => {
-      v.width = v.videoWidth
-      v.height = v.videoHeight
-      canvasRef.current!.width = v.videoWidth
-      canvasRef.current!.height = v.videoHeight
-      hudRef.current!.width = v.videoWidth
-      hudRef.current!.height = v.videoHeight
+      v.width = v.videoWidth; v.height = v.videoHeight
+      const cw = canvasRef.current!, hw = hudRef.current!
+      cw.width = v.videoWidth; cw.height = v.videoHeight
+      hw.width = v.videoWidth; hw.height = v.videoHeight
       setReady(true)
     }
   }, [])
 
-  const start = useCallback(() => {
+  const start = useCallback(async () => {
     if (!detector || !ready) return
+    const v = videoRef.current!
+    try { if (v.paused) await v.play() } catch {} // iOS 需手势触发，点击“开始”算手势
     setRunning(true)
     setMsg('')
     loop()
   }, [detector, ready])
 
-  const stop = useCallback(() => {
-    setRunning(false)
-    if (raf.current) cancelAnimationFrame(raf.current)
-  }, [])
+  const stop = useCallback(() => { setRunning(false); if (raf.current) cancelAnimationFrame(raf.current) }, [])
 
   const drawPose = (ctx: CanvasRenderingContext2D, kps: KP[]) => {
-    ctx.save()
-    ctx.lineWidth = 3
-    ctx.strokeStyle = 'rgba(34,211,238,0.9)'
-    ctx.fillStyle = 'rgba(34,211,238,0.9)'
-    const pairs: [number, number][] = [
-      [KP_NAMES.leftShoulder, KP_NAMES.rightShoulder],
-      [KP_NAMES.leftHip, KP_NAMES.rightHip],
-      [KP_NAMES.leftShoulder, KP_NAMES.leftElbow],
-      [KP_NAMES.leftElbow, KP_NAMES.leftWrist],
-      [KP_NAMES.rightShoulder, KP_NAMES.rightElbow],
-      [KP_NAMES.rightElbow, KP_NAMES.rightWrist],
-      [KP_NAMES.leftHip, KP_NAMES.leftKnee],
-      [KP_NAMES.leftKnee, KP_NAMES.leftAnkle],
-      [KP_NAMES.rightHip, KP_NAMES.rightKnee],
-      [KP_NAMES.rightKnee, KP_NAMES.rightAnkle],
-      [KP_NAMES.leftShoulder, KP_NAMES.leftHip],
-      [KP_NAMES.rightShoulder, KP_NAMES.rightHip],
-    ]
-    for (const [a,b] of pairs) {
-      const p1 = kps[a], p2 = kps[b]
-      if (p1?.score && p2?.score && p1.score>0.3 && p2.score>0.3) {
-        ctx.beginPath()
-        ctx.moveTo(p1.x, p1.y)
-        ctx.lineTo(p2.x, p2.y)
-        ctx.stroke()
-      }
-    }
-    kps.forEach(k => {
-      if (k?.score && k.score > 0.3) {
-        ctx.beginPath()
-        ctx.arc(k.x, k.y, 4, 0, Math.PI*2)
-        ctx.fill()
-      }
-    })
+    ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(34,211,238,0.9)'; ctx.fillStyle = 'rgba(34,211,238,0.9)'
+    const pairs: [number, number][] = [[5,6],[11,12],[5,7],[7,9],[6,8],[8,10],[11,13],[13,15],[12,14],[14,16],[5,11],[6,12]]
+    for (const [a,b] of pairs) { const p1:any = kps[a], p2:any = kps[b]; if (p1?.score>0.3 && p2?.score>0.3) { ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke() } }
+    kps.forEach((k:any) => { if (k?.score>0.3) { ctx.beginPath(); ctx.arc(k.x,k.y,4,0,Math.PI*2); ctx.fill() } })
     ctx.restore()
   }
 
   const detectBall = (ctx: CanvasRenderingContext2D): Ball => {
     const { width, height } = ctx.canvas
-    const img = ctx.getImageData(0, 0, width, height)
+    let img: ImageData
+    try { img = ctx.getImageData(0,0,width,height) } catch { return {x:0,y:0,r:0,ok:false} }
     let sx=0, sy=0, n=0
     for (let i=0; i<img.data.length; i+=4) {
       const r=img.data[i], g=img.data[i+1], b=img.data[i+2]
-      if (r>150 && g>70 && g<180 && b<120 && (r-g)>30 && (g-b)>10) {
-        const idx = (i/4)
-        const x = idx % width
-        const y = Math.floor(idx / width)
-        sx+=x; sy+=y; n++
-      }
+      if (r>150 && g>70 && g<180 && b<120 && (r-g)>30 && (g-b)>10) { const idx=i/4; const x=idx%width; const y=Math.floor(idx/width); sx+=x; sy+=y; n++ }
     }
     if (n<50) return { x:0,y:0,r:0,ok:false }
-    const cx = sx/n, cy = sy/n
-    return { x: cx, y: cy, r: 10, ok: true }
+    return { x: sx/n, y: sy/n, r: 10, ok: true }
   }
 
-  const latest = useRef<{kps: KP[]|null, ball: Ball|null, lastBallY: number|null, releaseDetected: boolean}>({kps:null, ball:null, lastBallY:null, releaseDetected:false})
+  const latest = useRef<{lastBallY: number|null}>({lastBallY:null})
   const currentShot = useRef<Shot | null>(null)
 
   const logic = (kps: KP[]|null, ball: Ball|null, t: number) => {
-    const leftElbow = kps?.[KP_NAMES.leftElbow]; const leftShoulder = kps?.[KP_NAMES.leftShoulder]; const leftWrist = kps?.[KP_NAMES.leftWrist]
-    const rightElbow = kps?.[KP_NAMES.rightElbow]; const rightShoulder = kps?.[KP_NAMES.rightShoulder]; const rightWrist = kps?.[KP_NAMES.rightWrist]
-    const leftKnee = kps?.[KP_NAMES.leftKnee]; const leftHip = kps?.[KP_NAMES.leftHip]; const rightKnee = kps?.[KP_NAMES.rightKnee]; const rightHip = kps?.[KP_NAMES.rightHip]
-
+    const leftElbow = kps?.[7]; const leftShoulder = kps?.[5]; const leftWrist = kps?.[9]
+    const rightElbow = kps?.[8]; const rightShoulder = kps?.[6]; const rightWrist = kps?.[10]
+    const leftKnee = kps?.[13]; const leftHip = kps?.[11]; const rightKnee = kps?.[14]; const rightHip = kps?.[12]
     const elbowAngleLeft = (leftElbow&&leftShoulder&&leftWrist)? angleDeg(leftShoulder,leftElbow,leftWrist) : null
     const elbowAngleRight = (rightElbow&&rightShoulder&&rightWrist)? angleDeg(rightShoulder,rightElbow,rightWrist) : null
-    const kneeAngleLeft = (leftHip&&leftKnee&&kps?.[KP_NAMES.leftAnkle])? angleDeg(leftHip,leftKnee,kps[KP_NAMES.leftAnkle]) : null
-    const kneeAngleRight = (rightHip&&rightKnee&&kps?.[KP_NAMES.rightAnkle])? angleDeg(rightHip,rightKnee,kps[KP_NAMES.rightAnkle]) : null
-
+    const kneeAngleLeft = (leftHip&&leftKnee&&kps?.[15])? angleDeg(leftHip,leftKnee,kps[15]) : null
+    const kneeAngleRight = (rightHip&&rightKnee&&kps?.[16])? angleDeg(rightHip,rightKnee,kps[16]) : null
     const elbowAngle = elbowAngleRight ?? elbowAngleLeft ?? null
     const kneeAngle = Math.min(kneeAngleLeft ?? 180, kneeAngleRight ?? 180)
-
     const wristsBelowShoulders = (leftWrist && leftShoulder && leftWrist.y > leftShoulder.y) || (rightWrist && rightShoulder && rightWrist.y > rightShoulder.y)
-    if (!currentShot.current && kneeAngle < 165 && wristsBelowShoulders) {
-      currentShot.current = { id: `shot-${Date.now()}`, tStart: t, tRelease: null, tApex: null, tEnd: null, made: null, kneeDipAngle: kneeAngle ?? undefined }
-      setState('tracking')
-    }
-
-    if (currentShot.current && !currentShot.current.tRelease && elbowAngle && elbowAngle > 165 && ((rightWrist && rightShoulder && rightWrist.y < rightShoulder.y) || (leftWrist && leftShoulder && leftWrist.y < leftShoulder.y))) {
-      currentShot.current.tRelease = t
-      currentShot.current.releaseElbowAngle = elbowAngle
-      setState('released')
-    }
-
-    if (currentShot.current && currentShot.current.tRelease && hoop && ball?.ok) {
-      const fromAbove = ball.y < hoop.y + 0.3 * hoop.h
-      const inside = ball.x > hoop.x && ball.x < hoop.x + hoop.w && ball.y > hoop.y && ball.y < hoop.y + hoop.h
-      if (fromAbove && inside) {
-        currentShot.current.made = true
-        currentShot.current.tEnd = t
-        setShots(prev => [...prev, currentShot.current!])
-        currentShot.current = null
-        setState('idle')
-      }
-    }
-
-    if (currentShot.current && currentShot.current.tRelease && t - currentShot.current.tRelease > 2.0) {
-      if (ball?.ok && hoop && ball.y > hoop.y + hoop.h + 15) {
-        currentShot.current.made = false
-        currentShot.current.tEnd = t
-        setShots(prev => [...prev, currentShot.current!])
-        currentShot.current = null
-        setState('idle')
-      }
-    }
+    if (!currentShot.current && kneeAngle < 165 && wristsBelowShoulders) { currentShot.current = { id:`shot-${Date.now()}`, tStart:t, tRelease:null, tApex:null, tEnd:null, made:null, kneeDipAngle:kneeAngle ?? undefined } as Shot }
+    if (currentShot.current && !currentShot.current.tRelease && elbowAngle && elbowAngle > 165 && ((rightWrist && rightShoulder && rightWrist.y < rightShoulder.y) || (leftWrist && leftShoulder && leftWrist.y < leftShoulder.y))) { currentShot.current.tRelease = t; currentShot.current.releaseElbowAngle = elbowAngle }
+    if (currentShot.current && currentShot.current.tRelease && hoop && ball?.ok) { const fromAbove = ball.y < hoop.y + 0.3*hoop.h; const inside = ball.x>hoop.x && ball.x<hoop.x+hoop.w && ball.y>hoop.y && ball.y<hoop.y+hoop.h; if (fromAbove && inside) { currentShot.current.made=true; currentShot.current.tEnd=t; setShots(p=>[...p,currentShot.current!]); currentShot.current=null } }
+    if (currentShot.current && currentShot.current.tRelease && t - currentShot.current.tRelease > 2.0) { if (ball?.ok && hoop && ball.y > hoop.y + hoop.h + 15) { currentShot.current.made=false; currentShot.current.tEnd=t; setShots(p=>[...p,currentShot.current!]); currentShot.current=null } }
   }
 
   const loop = useCallback(async () => {
@@ -231,50 +130,29 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')!, hctx = hud.getContext('2d')!
     const t0 = performance.now()
     const tick = async () => {
-      if (!running || !detector) { return }
-      ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
-      const poses = await detector.estimatePoses(v)
-      const kps: KP[] = poses?.[0]?.keypoints?.map((k: any) => ({ x: k.x, y: k.y, score: k.score })) ?? []
-      const ball = detectBall(ctx)
-      if (ball.ok) setBallTrace(prev => (prev.concat([{x: ball.x, y: ball.y}]).slice(-60)))
-      const t = (performance.now() - t0) / 1000
-      logic(kps, ball, t)
-      hctx.clearRect(0,0,hud.width,hud.height)
-      if (kps.length) drawPose(hctx, kps)
-      if (ball?.ok) {
-        hctx.strokeStyle = 'rgba(34,211,238,0.9)'; hctx.fillStyle = 'rgba(34,211,238,0.9)'
-        hctx.beginPath(); hctx.arc(ball.x, ball.y, 8, 0, Math.PI*2); hctx.stroke()
-        hctx.beginPath()
-        for (let i=0;i<ballTrace.length;i++) { const p = ballTrace[i]; if (i===0) hctx.moveTo(p.x, p.y); else hctx.lineTo(p.x, p.y) }
-        hctx.stroke()
-      }
-      if (hoop) {
-        hctx.strokeStyle = 'rgba(255,255,255,0.9)'
-        hctx.lineWidth = 2
-        hctx.strokeRect(hoop.x, hoop.y, hoop.w, hoop.h)
-        hctx.font = '12px sans-serif'; hctx.fillStyle = 'white'
-        hctx.fillText('Hoop ROI', hoop.x+4, hoop.y+14)
-      }
+      try {
+        if (!running || !detector) { return }
+        if (v.readyState < 2) { raf.current = requestAnimationFrame(tick as any); return }
+        ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
+        const poses = await detector.estimatePoses(v)
+        const kps: KP[] = poses?.[0]?.keypoints?.map((k: any) => ({ x:k.x, y:k.y, score:k.score })) ?? []
+        const ball = detectBall(ctx)
+        if (ball.ok) setBallTrace(prev => (prev.concat([{x:ball.x, y:ball.y}]).slice(-60)))
+        const t = (performance.now() - t0) / 1000
+        logic(kps, ball, t)
+        hctx.clearRect(0,0,hud.width,hud.height)
+        if (kps.length) drawPose(hctx, kps)
+        if (ball?.ok) { hctx.strokeStyle='rgba(34,211,238,0.9)'; hctx.beginPath(); hctx.arc(ball.x, ball.y, 8, 0, Math.PI*2); hctx.stroke() }
+        if (hoop) { hctx.strokeStyle='rgba(255,255,255,0.9)'; hctx.lineWidth=2; hctx.strokeRect(hoop.x, hoop.y, hoop.w, hoop.h); hctx.font='12px sans-serif'; hctx.fillStyle='white'; hctx.fillText('Hoop ROI', hoop.x+4, hoop.y+14) }
+      } catch (e) { /* 忽略单帧错误，继续下一帧 */ }
       raf.current = requestAnimationFrame(tick as any)
     }
     raf.current = requestAnimationFrame(tick as any)
   }, [detector, running, hoop, ballTrace])
 
   const dragging = useRef<{x:number,y:number}|null>(null)
-  const onHudDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-    setHoop({ x, y, w: 120, h: 70 })
-    dragging.current = { x, y }
-  }
-  const onHudMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!dragging.current) return
-    const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
-    setHoop(h => h ? ({ ...h, w: x - h.x, h: y - h.y }) : h)
-  }
+  const onHudDown = (e: React.MouseEvent<HTMLCanvasElement>) => { const rect = (e.target as HTMLCanvasElement).getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top; setHoop({ x, y, w: 120, h: 70 }); dragging.current = { x, y } }
+  const onHudMove = (e: React.MouseEvent<HTMLCanvasElement>) => { if (!dragging.current) return; const rect = (e.target as HTMLCanvasElement).getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top; setHoop(h => h ? ({ ...h, w: x - h.x, h: y - h.y }) : h) }
   const onHudUp = () => dragging.current = null
 
   const onPlay = () => { if (!running) start() }
@@ -286,18 +164,7 @@ export default function VideoAnalyzer() {
         <div className="flex items-center gap-3">
           <input type="file" accept="video/*" onChange={onFile} className="block w-full text-sm text-slate-300" />
           <button className="btn-outline" onClick={() => {
-            const v = videoRef.current!
-            v.muted = true
-            navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
-              v.srcObject = stream as any
-              v.onloadedmetadata = () => {
-                v.play()
-                v.width = v.videoWidth; v.height = v.videoHeight
-                canvasRef.current!.width = v.videoWidth; canvasRef.current!.height = v.videoHeight
-                hudRef.current!.width = v.videoWidth; hudRef.current!.height = v.videoHeight
-                setReady(true)
-              }
-            })
+            const v = videoRef.current!; v.muted = true; navigator.mediaDevices.getUserMedia({ video: true }).then(stream => { v.srcObject = stream as any; v.onloadedmetadata = () => { v.play(); v.width = v.videoWidth; v.height = v.videoHeight; const cw = canvasRef.current!, hw = hudRef.current!; cw.width = v.videoWidth; cw.height = v.videoHeight; hw.width = v.videoWidth; hw.height = v.videoHeight; setReady(true) } })
           }}>使用摄像头</button>
         </div>
         <div className="relative">
@@ -321,13 +188,7 @@ export default function VideoAnalyzer() {
             <li>命中：<b>{shots.filter(s => s.made).length}</b></li>
             <li>命中率：<b>{shots.length ? Math.round(100*shots.filter(s=>s.made).length/shots.length) : 0}%</b></li>
           </ul>
-          <button className="btn-outline mt-3" onClick={() => {
-            const blob = new Blob([JSON.stringify(shots, null, 2)], { type: 'application/json' })
-            const a = document.createElement('a')
-            a.href = URL.createObjectURL(blob)
-            a.download = 'shots.json'
-            a.click()
-          }}>导出 JSON</button>
+          <button className="btn-outline mt-3" onClick={() => { const blob = new Blob([JSON.stringify(shots, null, 2)], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'shots.json'; a.click() }}>导出 JSON</button>
         </div>
         <div className="card">
           <h3 className="text-lg font-medium mb-2">最近出手</h3>
@@ -338,9 +199,7 @@ export default function VideoAnalyzer() {
                   <span>#{s.id.slice(-6)}</span>
                   <span className={s.made ? 'text-emerald-400' : 'text-rose-400'}>{s.made ? '命中' : '未进'}</span>
                 </div>
-                <div className="text-slate-400 text-xs mt-1">
-                  释放肘角: {s.releaseElbowAngle?.toFixed(1) ?? '-'}°， 膝盖下蹲角: {s.kneeDipAngle?.toFixed(1) ?? '-'}°
-                </div>
+                <div className="text-slate-400 text-xs mt-1">释放肘角: {s.releaseElbowAngle?.toFixed(1) ?? '-'}°， 膝盖下蹲角: {s.kneeDipAngle?.toFixed(1) ?? '-'}°</div>
               </div>
             ))}
             {!shots.length && <p className="text-slate-400 text-sm">暂时没有数据</p>}
@@ -348,8 +207,7 @@ export default function VideoAnalyzer() {
         </div>
         <div className="card">
           <h3 className="text-lg font-medium mb-2">说明</h3>
-          <p className="text-slate-400 text-sm">若模型加载失败，通常是 CDN 在本地网络不可达。我已内置多重回退：MoveNet → BlazePose(Mediapipe CDN) → TFJS WASM。仍失败请更换网络或告知我把模型文件内置本仓库。
-          </p>
+          <p className="text-slate-400 text-sm">若点击“开始”无反应：1）确保视频已选择；2）在视频画面上先<strong>拖拽绘制篮筐 ROI</strong>；3）iOS 需手势触发播放，已在按钮中自动调用 play()；4）若仍异常，请刷新或更换视频再试。</p>
         </div>
       </aside>
     </div>
