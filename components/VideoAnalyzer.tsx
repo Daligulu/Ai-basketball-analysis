@@ -19,6 +19,50 @@ const KP_NAMES = {
 type Ball = { x: number, y: number, r: number, ok: boolean }
 type State = 'idle' | 'tracking' | 'released'
 
+async function createDetectorWithFallback() {
+  // 1) webgl backend
+  try {
+    await tf.setBackend('webgl')
+    await tf.ready()
+  } catch (_) {
+    // ignore, we'll try wasm below
+  }
+  // 2) Try MoveNet first (may fail in部分地区因 tfhub 访问)
+  try {
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+      modelType: 'lightning',
+    } as any)
+    return { det, note: 'MoveNet ✔︎' }
+  } catch (e) {
+    console.warn('MoveNet load failed, fallback to BlazePose', e)
+  }
+  // 3) Fallback: BlazePose via Mediapipe CDN (一般在国内也可访问 jsDelivr)
+  try {
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, {
+      runtime: 'mediapipe',
+      modelType: 'lite',
+      solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose'
+    } as any)
+    return { det, note: '已切换为 BlazePose ✔︎' }
+  } catch (e) {
+    console.warn('BlazePose load failed, fallback to WASM MoveNet', e)
+  }
+  // 4) Last resort: WASM backend + MoveNet (指定 wasm CDN 路径)
+  try {
+    const wasm = await import('@tensorflow/tfjs-backend-wasm')
+    ;(wasm as any).setWasmPaths?.('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.19.0/dist/')
+    await tf.setBackend('wasm')
+    await tf.ready()
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+      modelType: 'lightning',
+    } as any)
+    return { det, note: '使用 WASM 后端 ✔︎' }
+  } catch (e) {
+    console.error('All detectors failed', e)
+    throw e
+  }
+}
+
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -33,19 +77,15 @@ export default function VideoAnalyzer() {
   const raf = useRef<number | null>(null)
   const [msg, setMsg] = useState('')
 
-  // Init model (register webgl backend and ready TF)
+  // Init detector with fallbacks
   useEffect(() => {
     (async () => {
       try {
-        await tf.setBackend('webgl')
-        await tf.ready()
-        const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
-          modelType: 'lightning',
-        } as any)
+        const { det, note } = await createDetectorWithFallback()
         setDetector(det)
+        setMsg(note)
       } catch (e) {
-        console.error(e)
-        setMsg('模型加载失败，请刷新页面重试。')
+        setMsg('模型加载失败：网络或 CDN 访问受限。可尝试切换网络后刷新。')
       }
     })()
   }, [])
@@ -118,13 +158,11 @@ export default function VideoAnalyzer() {
   }
 
   const detectBall = (ctx: CanvasRenderingContext2D): Ball => {
-    // naive "orange-ish" color thresholding
     const { width, height } = ctx.canvas
     const img = ctx.getImageData(0, 0, width, height)
     let sx=0, sy=0, n=0
     for (let i=0; i<img.data.length; i+=4) {
       const r=img.data[i], g=img.data[i+1], b=img.data[i+2]
-      // heuristic: basketball orange (R high, G mid, B low)
       if (r>150 && g>70 && g<180 && b<120 && (r-g)>30 && (g-b)>10) {
         const idx = (i/4)
         const x = idx % width
@@ -153,21 +191,18 @@ export default function VideoAnalyzer() {
     const elbowAngle = elbowAngleRight ?? elbowAngleLeft ?? null
     const kneeAngle = Math.min(kneeAngleLeft ?? 180, kneeAngleRight ?? 180)
 
-    // Start a shot when knees bent and wrists below shoulders
     const wristsBelowShoulders = (leftWrist && leftShoulder && leftWrist.y > leftShoulder.y) || (rightWrist && rightShoulder && rightWrist.y > rightShoulder.y)
     if (!currentShot.current && kneeAngle < 165 && wristsBelowShoulders) {
       currentShot.current = { id: `shot-${Date.now()}`, tStart: t, tRelease: null, tApex: null, tEnd: null, made: null, kneeDipAngle: kneeAngle ?? undefined }
       setState('tracking')
     }
 
-    // detect release: quick elbow extension and wrist above shoulder
     if (currentShot.current && !currentShot.current.tRelease && elbowAngle && elbowAngle > 165 && ((rightWrist && rightShoulder && rightWrist.y < rightShoulder.y) || (leftWrist && leftShoulder && leftWrist.y < leftShoulder.y))) {
       currentShot.current.tRelease = t
       currentShot.current.releaseElbowAngle = elbowAngle
       setState('released')
     }
 
-    // made/miss by hoop ROI crossing after release (simple heuristic)
     if (currentShot.current && currentShot.current.tRelease && hoop && ball?.ok) {
       const fromAbove = ball.y < hoop.y + 0.3 * hoop.h
       const inside = ball.x > hoop.x && ball.x < hoop.x + hoop.w && ball.y > hoop.y && ball.y < hoop.y + hoop.h
@@ -180,7 +215,6 @@ export default function VideoAnalyzer() {
       }
     }
 
-    // miss: ball falls below hoop area after release and 2s timeout
     if (currentShot.current && currentShot.current.tRelease && t - currentShot.current.tRelease > 2.0) {
       if (ball?.ok && hoop && ball.y > hoop.y + hoop.h + 15) {
         currentShot.current.made = false
@@ -198,33 +232,20 @@ export default function VideoAnalyzer() {
     const t0 = performance.now()
     const tick = async () => {
       if (!running || !detector) { return }
-      // draw current frame
       ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
-
-      // pose
       const poses = await detector.estimatePoses(v)
       const kps: KP[] = poses?.[0]?.keypoints?.map((k: any) => ({ x: k.x, y: k.y, score: k.score })) ?? []
-
-      // ball
       const ball = detectBall(ctx)
       if (ball.ok) setBallTrace(prev => (prev.concat([{x: ball.x, y: ball.y}]).slice(-60)))
-
-      // logic
       const t = (performance.now() - t0) / 1000
       logic(kps, ball, t)
-
-      // HUD
       hctx.clearRect(0,0,hud.width,hud.height)
       if (kps.length) drawPose(hctx, kps)
       if (ball?.ok) {
         hctx.strokeStyle = 'rgba(34,211,238,0.9)'; hctx.fillStyle = 'rgba(34,211,238,0.9)'
         hctx.beginPath(); hctx.arc(ball.x, ball.y, 8, 0, Math.PI*2); hctx.stroke()
-        // trace
         hctx.beginPath()
-        for (let i=0;i<ballTrace.length;i++) {
-          const p = ballTrace[i]
-          if (i===0) hctx.moveTo(p.x, p.y); else hctx.lineTo(p.x, p.y)
-        }
+        for (let i=0;i<ballTrace.length;i++) { const p = ballTrace[i]; if (i===0) hctx.moveTo(p.x, p.y); else hctx.lineTo(p.x, p.y) }
         hctx.stroke()
       }
       if (hoop) {
@@ -234,13 +255,11 @@ export default function VideoAnalyzer() {
         hctx.font = '12px sans-serif'; hctx.fillStyle = 'white'
         hctx.fillText('Hoop ROI', hoop.x+4, hoop.y+14)
       }
-
       raf.current = requestAnimationFrame(tick as any)
     }
     raf.current = requestAnimationFrame(tick as any)
   }, [detector, running, hoop, ballTrace])
 
-  // hoop ROI draw / drag
   const dragging = useRef<{x:number,y:number}|null>(null)
   const onHudDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = (e.target as HTMLCanvasElement).getBoundingClientRect()
@@ -302,16 +321,13 @@ export default function VideoAnalyzer() {
             <li>命中：<b>{shots.filter(s => s.made).length}</b></li>
             <li>命中率：<b>{shots.length ? Math.round(100*shots.filter(s=>s.made).length/shots.length) : 0}%</b></li>
           </ul>
-          <button
-            className="btn-outline mt-3"
-            onClick={() => {
-              const blob = new Blob([JSON.stringify(shots, null, 2)], { type: 'application/json' })
-              const a = document.createElement('a')
-              a.href = URL.createObjectURL(blob)
-              a.download = 'shots.json'
-              a.click()
-            }}
-          >导出 JSON</button>
+          <button className="btn-outline mt-3" onClick={() => {
+            const blob = new Blob([JSON.stringify(shots, null, 2)], { type: 'application/json' })
+            const a = document.createElement('a')
+            a.href = URL.createObjectURL(blob)
+            a.download = 'shots.json'
+            a.click()
+          }}>导出 JSON</button>
         </div>
         <div className="card">
           <h3 className="text-lg font-medium mb-2">最近出手</h3>
@@ -332,9 +348,7 @@ export default function VideoAnalyzer() {
         </div>
         <div className="card">
           <h3 className="text-lg font-medium mb-2">说明</h3>
-          <p className="text-slate-400 text-sm">
-            本 Demo 借鉴了社区中关于“姿态识别 + 篮球轨迹”的开源想法，采用浏览器端 MoveNet/BlazePose 接口进行人体关键点检测，
-            并通过<strong>橙色像素聚类</strong>近似跟踪篮球以判断是否穿过自定义篮筐区域。机位、光线与球颜色会影响结果。
+          <p className="text-slate-400 text-sm">若模型加载失败，通常是 CDN 在本地网络不可达。我已内置多重回退：MoveNet → BlazePose(Mediapipe CDN) → TFJS WASM。仍失败请更换网络或告知我把模型文件内置本仓库。
           </p>
         </div>
       </aside>
