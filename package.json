@@ -1,6 +1,6 @@
 {
   "name": "ai-basketball-analysis-vercel",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -11,7 +11,7 @@
     "next": "14.2.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "@tensorflow-models/pose-detection": "^3.0.0",
+    "@tensorflow-models/pose-detection": "^2.0.1",
     "@tensorflow/tfjs-backend-webgl": "^4.19.0",
     "@tensorflow/tfjs-converter": "^4.19.0",
     "@tensorflow/tfjs-core": "^4.19.0",
