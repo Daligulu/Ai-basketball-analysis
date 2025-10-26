@@ -1,12 +1,13 @@
 {
   "name": "ai-basketball-analysis-vercel",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "postinstall": "node ./scripts/prepare-assets.mjs"
+    "postinstall": "node ./scripts/vendor-models.mjs || true",
+    "vendor:models": "node ./scripts/vendor-models.mjs"
   },
   "dependencies": {
     "next": "14.2.5",
