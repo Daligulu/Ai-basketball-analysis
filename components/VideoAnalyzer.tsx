@@ -14,67 +14,40 @@ const LOCAL = {
   wasmDir: '/wasm/'
 }
 
+const BUILD_TAG = 'fallback-v2'
+
 async function headOk(url: string) {
   try { const r = await fetch(url, { method: 'HEAD' }); return r.ok } catch { return false }
 }
 
 async function createDetectorPreferLocal(setMsg: (s: string) => void) {
-  // 0) Backend: try webgl, else wasm (with local paths)
-  try { await tf.setBackend('webgl'); await tf.ready(); setMsg('WebGL 后端 ✔︎') }
-  catch {
-    const wasm = await import('@tensorflow/tfjs-backend-wasm');
-    ;(wasm as any).setWasmPaths?.(LOCAL.wasmDir)
-    await tf.setBackend('wasm'); await tf.ready(); setMsg('WASM 后端 ✔︎')
-  }
+  try { await tf.setBackend('webgl'); await tf.ready(); setMsg(`WebGL 后端 ✔︎ · ${BUILD_TAG}`) }
+  catch { const wasm = await import('@tensorflow/tfjs-backend-wasm'); (wasm as any).setWasmPaths?.(LOCAL.wasmDir); await tf.setBackend('wasm'); await tf.ready(); setMsg(`WASM 后端 ✔︎ · ${BUILD_TAG}`) }
 
-  // A) 本地 BlazePose (Mediapipe) —— 只要目录存在就优先使用，完全离线
   if (await headOk(`${LOCAL.mpPoseDir}/pose_solution_packed_assets.data`)) {
     try {
-      const det = await poseDetection.createDetector(
-        poseDetection.SupportedModels.BlazePose,
-        { runtime: 'mediapipe', modelType: 'lite', solutionPath: LOCAL.mpPoseDir } as any
-      )
-      setMsg('BlazePose（本地）✔︎')
-      return det
+      const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, { runtime: 'mediapipe', modelType: 'lite', solutionPath: LOCAL.mpPoseDir } as any)
+      setMsg(`BlazePose（本地）✔︎ · ${BUILD_TAG}`); return det
     } catch (e) { console.warn('Local BlazePose failed', e) }
   }
 
-  // B) 本地 MoveNet（TFJS）
   if (await headOk(LOCAL.movenet)) {
     try {
-      const det = await poseDetection.createDetector(
-        poseDetection.SupportedModels.MoveNet,
-        { modelType: 'lightning', modelUrl: LOCAL.movenet } as any
-      )
-      setMsg('MoveNet（本地）✔︎')
-      return det
+      const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, { modelType: 'lightning', modelUrl: LOCAL.movenet } as any)
+      setMsg(`MoveNet（本地）✔︎ · ${BUILD_TAG}`); return det
     } catch (e) { console.warn('Local MoveNet failed', e) }
   }
 
-  // C) 远端（作为兜底）
+  // —— 回退：远端资源 ——
   try {
-    const det = await poseDetection.createDetector(
-      poseDetection.SupportedModels.MoveNet,
-      { modelType: 'lightning' } as any
-    )
-    setMsg('MoveNet（TFHub）✔︎')
-    return det
+    const det = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, { modelType: 'lightning' } as any)
+    setMsg(`MoveNet（TFHub 回退）✔︎ · ${BUILD_TAG}`); return det
   } catch (e) { console.warn('Remote MoveNet failed → try remote BlazePose', e) }
 
-  try {
-    const det = await poseDetection.createDetector(
-      poseDetection.SupportedModels.BlazePose,
-      { runtime: 'mediapipe', modelType: 'lite', solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose' } as any
-    )
-    setMsg('BlazePose（CDN）✔︎')
-    return det
-  } catch (e) {
-    console.error('All detectors failed', e)
-    throw e
-  }
+  const det = await poseDetection.createDetector(poseDetection.SupportedModels.BlazePose, { runtime: 'mediapipe', modelType: 'lite', solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/pose' } as any)
+  setMsg(`BlazePose（CDN 回退）✔︎ · ${BUILD_TAG}`)
+  return det
 }
-
-type Ball = { x: number, y: number, r: number, ok: boolean }
 
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -83,8 +56,6 @@ export default function VideoAnalyzer() {
 
   const [detector, setDetector] = useState<poseDetection.PoseDetector | null>(null)
   const [ready, setReady] = useState(false)
-  const [hoop, setHoop] = useState<Hoop>(null)
-  const [shots, setShots] = useState<Shot[]>([])
   const [msg, setMsg] = useState('正在加载模型…')
 
   const runningRef = useRef(false)
@@ -92,12 +63,7 @@ export default function VideoAnalyzer() {
   const raf = useRef<number | null>(null)
   useEffect(() => { detectorRef.current = detector }, [detector])
 
-  useEffect(() => {
-    (async () => {
-      try { const det = await createDetectorPreferLocal(setMsg); setDetector(det) }
-      catch (e:any) { setMsg('模型加载失败：' + (e?.message || '未知错误')) }
-    })()
-  }, [])
+  useEffect(() => { (async () => { try { const det = await createDetectorPreferLocal(setMsg); setDetector(det) } catch (e:any) { setMsg('模型加载失败：' + (e?.message || '未知错误')) } })() }, [])
 
   const onFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]; if (!file) return
@@ -120,12 +86,10 @@ export default function VideoAnalyzer() {
         if (!v || !canvas || !hud) { raf.current = requestAnimationFrame(tick); return }
         if (!runningRef.current || !det) { raf.current = requestAnimationFrame(tick); return }
         if (v.readyState < 2) { raf.current = requestAnimationFrame(tick); return }
-
-        const ctx = canvas.getContext('2d')!; const hctx = hud.getContext('2d')!
+        const ctx = canvas.getContext('2d')!, hctx = hud.getContext('2d')!
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
         const poses = await det.estimatePoses(v)
         const kps: KP[] = (poses?.[0]?.keypoints ?? []).map((k: any) => ({ x:k.x, y:k.y, score:k.score }))
-
         hctx.clearRect(0,0,hud.width,hud.height)
         if (kps.length){
           hctx.save(); hctx.lineWidth=3; hctx.strokeStyle='rgba(34,211,238,0.9)'; hctx.fillStyle='rgba(34,211,238,0.9)'
@@ -144,8 +108,7 @@ export default function VideoAnalyzer() {
     if (!detectorRef.current || !ready) return
     const v = videoRef.current!
     try { if (v.paused) { v.muted = true; await v.play() } } catch {}
-    runningRef.current = true; setMsg('模型已加载 ✔︎')
-    ensureLoop()
+    runningRef.current = true; setMsg(`模型已加载 ✔︎ · ${BUILD_TAG}`); ensureLoop()
   }, [ready, ensureLoop])
 
   const stop = useCallback(() => { runningRef.current = false }, [])
