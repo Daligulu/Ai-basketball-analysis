@@ -1,0 +1,66 @@
+name: Vendor local models into public
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'public/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps (for copying mediapipe & wasm)
+        run: npm ci
+
+      - name: Prepare directories
+        run: |
+          mkdir -p public/models/movenet_lightning
+          mkdir -p public/mediapipe/pose
+          mkdir -p public/wasm
+
+      - name: Vendor MoveNet Lightning (TFJS)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BASE="https://storage.googleapis.com/tfhub-tfjs-modules/google/tfjs-model/movenet/singlepose/lightning/4"
+          curl -L "$BASE/model.json" -o public/models/movenet_lightning/model.json
+          jq -r '.weightsManifest[] | .paths[]' public/models/movenet_lightning/model.json | while read -r p; do
+            curl -L "$BASE/$p" -o "public/models/movenet_lightning/$p"
+          done
+          ls -lh public/models/movenet_lightning
+
+      - name: Vendor Mediapipe Pose (local runtime files)
+        run: |
+          rsync -a node_modules/@mediapipe/pose/ public/mediapipe/pose/
+          ls -lh public/mediapipe/pose | head -n 50
+
+      - name: Vendor TFJS WASM files
+        run: |
+          rsync -a node_modules/@tensorflow/tfjs-backend-wasm/dist/ public/wasm/
+          ls -lh public/wasm | head -n 50
+
+      - name: Commit and push if changes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -A public/models/movenet_lightning public/mediapipe/pose public/wasm
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore(models): vendor MoveNet/mediapipe/wasm into public for offline use"
+          git push
