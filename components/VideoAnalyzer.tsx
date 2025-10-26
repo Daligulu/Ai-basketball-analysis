@@ -48,10 +48,17 @@ export default function VideoAnalyzer() {
   const [hoop, setHoop] = useState<Hoop>(null)
   const [shots, setShots] = useState<Shot[]>([])
   const [state, setState] = useState<State>('idle')
-  const [ballTrace, setBallTrace] = useState<{x:number,y:number}[]>([])
-  const raf = useRef<number | null>(null)
   const [msg, setMsg] = useState('')
 
+  // realtime flags via refs to avoid stale closures
+  const runningRef = useRef(false)
+  const detectorRef = useRef<poseDetection.PoseDetector | null>(null)
+  const raf = useRef<number | null>(null)
+
+  useEffect(() => { runningRef.current = running }, [running])
+  useEffect(() => { detectorRef.current = detector }, [detector])
+
+  // Init detector with fallbacks
   useEffect(() => {
     (async () => {
       try { const { det, note } = await createDetectorWithFallback(); setDetector(det); setMsg(note) }
@@ -63,6 +70,7 @@ export default function VideoAnalyzer() {
     const file = e.target.files?.[0]; if (!file) return
     const url = URL.createObjectURL(file)
     const v = videoRef.current!
+    v.crossOrigin = 'anonymous'
     v.src = url
     v.onloadedmetadata = () => {
       v.width = v.videoWidth; v.height = v.videoHeight
@@ -73,89 +81,72 @@ export default function VideoAnalyzer() {
     }
   }, [])
 
+  const ensureLoop = useCallback(() => {
+    if (raf.current == null) {
+      const tick = async () => {
+        try {
+          const v = videoRef.current, det = detectorRef.current, canvas = canvasRef.current, hud = hudRef.current
+          if (!v || !canvas || !hud) { raf.current = requestAnimationFrame(tick); return }
+          // always keep RAF alive; skip heavy work when not running
+          if (!runningRef.current || !det) { raf.current = requestAnimationFrame(tick); return }
+          if (v.readyState < 2) { raf.current = requestAnimationFrame(tick); return }
+
+          const ctx = canvas.getContext('2d')!
+          const hctx = hud.getContext('2d')!
+          ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
+
+          const poses = await det.estimatePoses(v)
+          const kps: KP[] = (poses?.[0]?.keypoints ?? []).map((k: any) => ({ x:k.x, y:k.y, score:k.score }))
+
+          // ball detection (simple color threshold)
+          let ball: Ball | null = null
+          try {
+            const img = ctx.getImageData(0,0,canvas.width,canvas.height)
+            let sx=0, sy=0, n=0
+            for (let i=0;i<img.data.length;i+=4){ const r=img.data[i],g=img.data[i+1],b=img.data[i+2]; if (r>150 && g>70 && g<180 && b<120 && (r-g)>30 && (g-b)>10){ const idx=i/4; const x=idx%canvas.width; const y=Math.floor(idx/canvas.width); sx+=x; sy+=y; n++ } }
+            if (n>=50) ball = { x:sx/n, y:sy/n, r:10, ok:true }
+          } catch {}
+
+          // update HUD
+          hctx.clearRect(0,0,hud.width,hud.height)
+          if (kps.length){
+            hctx.save(); hctx.lineWidth=3; hctx.strokeStyle='rgba(34,211,238,0.9)'; hctx.fillStyle='rgba(34,211,238,0.9)'
+            const pairs: [number, number][] = [[5,6],[11,12],[5,7],[7,9],[6,8],[8,10],[11,13],[13,15],[12,14],[14,16],[5,11],[6,12]]
+            for (const [a,b] of pairs){ const p1:any=kps[a], p2:any=kps[b]; if (p1?.score>0.3 && p2?.score>0.3){ hctx.beginPath(); hctx.moveTo(p1.x,p1.y); hctx.lineTo(p2.x,p2.y); hctx.stroke() } }
+            kps.forEach((k:any)=>{ if(k?.score>0.3){ hctx.beginPath(); hctx.arc(k.x,k.y,4,0,Math.PI*2); hctx.fill() } })
+            hctx.restore()
+          }
+          if (ball?.ok){ hctx.strokeStyle='rgba(34,211,238,0.9)'; hctx.beginPath(); hctx.arc(ball.x,ball.y,8,0,Math.PI*2); hctx.stroke() }
+          if (hoop){ hctx.strokeStyle='rgba(255,255,255,0.9)'; hctx.lineWidth=2; hctx.strokeRect(hoop.x,hoop.y,hoop.w,hoop.h); hctx.font='12px sans-serif'; hctx.fillStyle='white'; hctx.fillText('Hoop ROI', hoop.x+4, hoop.y+14) }
+        } catch { /* ignore frame errors */ }
+        raf.current = requestAnimationFrame(tick)
+      }
+      raf.current = requestAnimationFrame(tick)
+    }
+  }, [hoop])
+
   const start = useCallback(async () => {
-    if (!detector || !ready) return
+    if (!detectorRef.current || !ready) return
     const v = videoRef.current!
-    try { if (v.paused) await v.play() } catch {} // iOS 需手势触发，点击“开始”算手势
+    try { if (v.paused) await v.play() } catch {}
+    runningRef.current = true
     setRunning(true)
     setMsg('')
-    loop()
-  }, [detector, ready])
+    ensureLoop()
+  }, [ready, ensureLoop])
 
-  const stop = useCallback(() => { setRunning(false); if (raf.current) cancelAnimationFrame(raf.current) }, [])
+  const stop = useCallback(() => {
+    runningRef.current = false
+    setRunning(false)
+  }, [])
 
-  const drawPose = (ctx: CanvasRenderingContext2D, kps: KP[]) => {
-    ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(34,211,238,0.9)'; ctx.fillStyle = 'rgba(34,211,238,0.9)'
-    const pairs: [number, number][] = [[5,6],[11,12],[5,7],[7,9],[6,8],[8,10],[11,13],[13,15],[12,14],[14,16],[5,11],[6,12]]
-    for (const [a,b] of pairs) { const p1:any = kps[a], p2:any = kps[b]; if (p1?.score>0.3 && p2?.score>0.3) { ctx.beginPath(); ctx.moveTo(p1.x,p1.y); ctx.lineTo(p2.x,p2.y); ctx.stroke() } }
-    kps.forEach((k:any) => { if (k?.score>0.3) { ctx.beginPath(); ctx.arc(k.x,k.y,4,0,Math.PI*2); ctx.fill() } })
-    ctx.restore()
-  }
-
-  const detectBall = (ctx: CanvasRenderingContext2D): Ball => {
-    const { width, height } = ctx.canvas
-    let img: ImageData
-    try { img = ctx.getImageData(0,0,width,height) } catch { return {x:0,y:0,r:0,ok:false} }
-    let sx=0, sy=0, n=0
-    for (let i=0; i<img.data.length; i+=4) {
-      const r=img.data[i], g=img.data[i+1], b=img.data[i+2]
-      if (r>150 && g>70 && g<180 && b<120 && (r-g)>30 && (g-b)>10) { const idx=i/4; const x=idx%width; const y=Math.floor(idx/width); sx+=x; sy+=y; n++ }
-    }
-    if (n<50) return { x:0,y:0,r:0,ok:false }
-    return { x: sx/n, y: sy/n, r: 10, ok: true }
-  }
-
-  const latest = useRef<{lastBallY: number|null}>({lastBallY:null})
-  const currentShot = useRef<Shot | null>(null)
-
-  const logic = (kps: KP[]|null, ball: Ball|null, t: number) => {
-    const leftElbow = kps?.[7]; const leftShoulder = kps?.[5]; const leftWrist = kps?.[9]
-    const rightElbow = kps?.[8]; const rightShoulder = kps?.[6]; const rightWrist = kps?.[10]
-    const leftKnee = kps?.[13]; const leftHip = kps?.[11]; const rightKnee = kps?.[14]; const rightHip = kps?.[12]
-    const elbowAngleLeft = (leftElbow&&leftShoulder&&leftWrist)? angleDeg(leftShoulder,leftElbow,leftWrist) : null
-    const elbowAngleRight = (rightElbow&&rightShoulder&&rightWrist)? angleDeg(rightShoulder,rightElbow,rightWrist) : null
-    const kneeAngleLeft = (leftHip&&leftKnee&&kps?.[15])? angleDeg(leftHip,leftKnee,kps[15]) : null
-    const kneeAngleRight = (rightHip&&rightKnee&&kps?.[16])? angleDeg(rightHip,rightKnee,kps[16]) : null
-    const elbowAngle = elbowAngleRight ?? elbowAngleLeft ?? null
-    const kneeAngle = Math.min(kneeAngleLeft ?? 180, kneeAngleRight ?? 180)
-    const wristsBelowShoulders = (leftWrist && leftShoulder && leftWrist.y > leftShoulder.y) || (rightWrist && rightShoulder && rightWrist.y > rightShoulder.y)
-    if (!currentShot.current && kneeAngle < 165 && wristsBelowShoulders) { currentShot.current = { id:`shot-${Date.now()}`, tStart:t, tRelease:null, tApex:null, tEnd:null, made:null, kneeDipAngle:kneeAngle ?? undefined } as Shot }
-    if (currentShot.current && !currentShot.current.tRelease && elbowAngle && elbowAngle > 165 && ((rightWrist && rightShoulder && rightWrist.y < rightShoulder.y) || (leftWrist && leftShoulder && leftWrist.y < leftShoulder.y))) { currentShot.current.tRelease = t; currentShot.current.releaseElbowAngle = elbowAngle }
-    if (currentShot.current && currentShot.current.tRelease && hoop && ball?.ok) { const fromAbove = ball.y < hoop.y + 0.3*hoop.h; const inside = ball.x>hoop.x && ball.x<hoop.x+hoop.w && ball.y>hoop.y && ball.y<hoop.y+hoop.h; if (fromAbove && inside) { currentShot.current.made=true; currentShot.current.tEnd=t; setShots(p=>[...p,currentShot.current!]); currentShot.current=null } }
-    if (currentShot.current && currentShot.current.tRelease && t - currentShot.current.tRelease > 2.0) { if (ball?.ok && hoop && ball.y > hoop.y + hoop.h + 15) { currentShot.current.made=false; currentShot.current.tEnd=t; setShots(p=>[...p,currentShot.current!]); currentShot.current=null } }
-  }
-
-  const loop = useCallback(async () => {
-    const v = videoRef.current!, canvas = canvasRef.current!, hud = hudRef.current!
-    const ctx = canvas.getContext('2d')!, hctx = hud.getContext('2d')!
-    const t0 = performance.now()
-    const tick = async () => {
-      try {
-        if (!running || !detector) { return }
-        if (v.readyState < 2) { raf.current = requestAnimationFrame(tick as any); return }
-        ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
-        const poses = await detector.estimatePoses(v)
-        const kps: KP[] = poses?.[0]?.keypoints?.map((k: any) => ({ x:k.x, y:k.y, score:k.score })) ?? []
-        const ball = detectBall(ctx)
-        if (ball.ok) setBallTrace(prev => (prev.concat([{x:ball.x, y:ball.y}]).slice(-60)))
-        const t = (performance.now() - t0) / 1000
-        logic(kps, ball, t)
-        hctx.clearRect(0,0,hud.width,hud.height)
-        if (kps.length) drawPose(hctx, kps)
-        if (ball?.ok) { hctx.strokeStyle='rgba(34,211,238,0.9)'; hctx.beginPath(); hctx.arc(ball.x, ball.y, 8, 0, Math.PI*2); hctx.stroke() }
-        if (hoop) { hctx.strokeStyle='rgba(255,255,255,0.9)'; hctx.lineWidth=2; hctx.strokeRect(hoop.x, hoop.y, hoop.w, hoop.h); hctx.font='12px sans-serif'; hctx.fillStyle='white'; hctx.fillText('Hoop ROI', hoop.x+4, hoop.y+14) }
-      } catch (e) { /* 忽略单帧错误，继续下一帧 */ }
-      raf.current = requestAnimationFrame(tick as any)
-    }
-    raf.current = requestAnimationFrame(tick as any)
-  }, [detector, running, hoop, ballTrace])
-
+  // hoop ROI draw / drag
   const dragging = useRef<{x:number,y:number}|null>(null)
   const onHudDown = (e: React.MouseEvent<HTMLCanvasElement>) => { const rect = (e.target as HTMLCanvasElement).getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top; setHoop({ x, y, w: 120, h: 70 }); dragging.current = { x, y } }
   const onHudMove = (e: React.MouseEvent<HTMLCanvasElement>) => { if (!dragging.current) return; const rect = (e.target as HTMLCanvasElement).getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top; setHoop(h => h ? ({ ...h, w: x - h.x, h: y - h.y }) : h) }
   const onHudUp = () => dragging.current = null
 
-  const onPlay = () => { if (!running) start() }
+  const onPlay = () => { if (!runningRef.current) start() }
   const onPause = () => { stop() }
 
   return (
